@@ -15,6 +15,11 @@
 DRAC inspection interface
 """
 
+from datetime import datetime
+import json
+import re
+import xml.etree.ElementTree as et
+
 from ironic_lib import metrics_utils
 from oslo_log import log as logging
 from oslo_utils import importutils
@@ -27,24 +32,137 @@ from ironic.common import utils
 from ironic.drivers import base
 from ironic.drivers.modules.drac import common as drac_common
 from ironic.drivers.modules.redfish import inspect as redfish_inspect
+from ironic.drivers.modules.redfish import utils as redfish_utils
 from ironic import objects
 
 drac_exceptions = importutils.try_import('dracclient.exceptions')
+sushy = importutils.try_import('sushy')
 
 LOG = logging.getLogger(__name__)
 
 METRICS = metrics_utils.get_metrics_logger(__name__)
 
+# System Configuration Tag Constant
+_SYSTEM_CONFIG_TAG = '<SystemConfiguration Model'
+
+# System Management Constant
+_SERVICE_ROOT = '/redfish/v1/Managers/'
+
+# Job Response Code Constant
+_JOB_RESPONSE_CODE = 200
+
 
 class DracRedfishInspect(redfish_inspect.RedfishInspect):
-    """iDRAC Redfish interface for inspection-related actions.
+    """iDRAC Redfish interface for inspection-related actions."""
 
-    Presently, this class entirely defers to its base class, a generic,
-    vendor-independent Redfish interface. Future resolution of Dell EMC-
-    specific incompatibilities and introduction of vendor value added
-    should be implemented by this class.
-    """
-    pass
+    def inspect_hardware(self, task):
+        """Inspect hardware to get the hardware properties.
+
+        Inspects hardware to get the essential properties.
+        It fails if any of the essential properties
+        are not received from the node.
+
+        :param task: a TaskManager instance.
+        :raises: HardwareInspectionFailure if essential properties
+                 could not be retrieved successfully.
+        :returns: The resulting state of inspection.
+
+        """
+        super(DracRedfishInspect, self).inspect_hardware(task)
+
+        node = task.node
+        pxe_port_macs = self._get_pxe_port_macs(task)
+        if pxe_port_macs is None:
+            LOG.warning("No PXE enabled NIC was found for node "
+                        "%(node_uuid)s.", {'node_uuid': node.uuid})
+            ports = objects.Port.list_by_node_id(task.context, node.id)
+            if ports:
+                for port in ports:
+                    if port.pxe_enabled:
+                        port.pxe_enabled = False
+                        port.save()
+            return states.MANAGEABLE
+
+        ports = objects.Port.list_by_node_id(task.context, node.id)
+        if ports:
+            for port in ports:
+                is_pxe_port_mac = (port.address.upper() in pxe_port_macs)
+                if port.pxe_enabled != is_pxe_port_mac:
+                    port.pxe_enabled = is_pxe_port_mac
+                    port.save()
+                    LOG.info('Port %(port)s having %(mac_address)s updated '
+                             'with pxe_enabled %(pxe)s for node %(node_uuid)s '
+                             'during inspection',
+                             {'port': port.uuid, 'mac_address': port.address,
+                              'pxe': port.pxe_enabled, 'node_uuid': node.uuid})
+        else:
+            LOG.warning("No port information discovered "
+                        "for node %(node)s", {'node': node.uuid})
+
+        return states.MANAGEABLE
+
+    def _get_pxe_port_macs(self, task):
+        """Get a list of pxe port MAC addresses.
+
+        :param task: a TaskManager instance.
+        :returns: Returns list of pxe port MAC addresses.
+        """
+        system = redfish_utils.get_system(task.node)
+
+        pxe_port_macs = []
+        pxe_params = ["PxeDev1EnDis", "PxeDev2EnDis",
+                      "PxeDev3EnDis", "PxeDev4EnDis"]
+        pxe_nics = ["PxeDev1Interface", "PxeDev2Interface",
+                    "PxeDev3Interface", "PxeDev4Interface"]
+
+        redfish_ip = task.node.driver_info.get('redfish_address')
+        redfish_username = task.node.driver_info.get('redfish_username')
+        redfish_password = task.node.driver_info.get('redfish_password')
+
+        # Get dictionary of ethernet interfaces
+        ethernet_interfaces = system.ethernet_interfaces.get_members()
+        ethernet_interfaces_mac_dict = {interface.identity: interface.mac_address for interface in ethernet_interfaces}
+
+        if system.boot.mode == 'uefi':
+            for param, nic in zip(pxe_params, pxe_nics):
+                if system.bios.attributes[param] == 'Enabled':
+                    nic_id = system.bios.attributes[nic]
+                    # Get MAC address of the given nic_id
+                    mac_address = ethernet_interfaces_mac_dict[nic_id]
+                    pxe_port_macs.append(mac_address)
+        elif system.boot.mode == 'bios':
+            # Get instance of OEM extension
+            authenticator = sushy.auth.BasicAuth(redfish_username, redfish_password)
+            url = '%s%s' % (redfish_ip, _SERVICE_ROOT)
+            conn = sushy.Sushy(url, verify=False, auth=authenticator)
+            manager = conn.get_manager('iDRAC.Embedded.1')
+            oem_manager = manager.get_oem_extension('Dell')
+            job_response = oem_manager.export_system_configuration(target="NIC")
+
+            if job_response.status_code != _JOB_RESPONSE_CODE:
+                error = (_('An error occurred when attempting to export '
+                           'the system configuration. Status code: %(code), '
+                           'Error details: %(err)'),
+                         {'code': job_response.status_code,
+                          'err': job_response.__dict__})
+                LOG.error(error)
+                raise exception.HardwareInspectionFailure(error=error)
+
+            if _SYSTEM_CONFIG_TAG in str(job_response.__dict__):
+                xml_string = job_response.__dict__.get('_content')
+                root = et.fromstring(xml_string)
+                for child in root:
+                    nic_id = [child.attrib.get('FQDD') for ch in child if
+                              ch.text == 'PXE']
+                    if nic_id:
+                        # Get MAC address of the given nic_id
+                        mac_address = ethernet_interfaces_mac_dict[nic_id[0]]
+                        pxe_port_macs.append(mac_address)
+                return pxe_port_macs
+            else:
+                error = (_('Failed to get system configuration from response'))
+                raise exception.HardwareInspectionFailure(error=error)
+        return pxe_port_macs
 
 
 class DracWSManInspect(base.InspectInterface):
