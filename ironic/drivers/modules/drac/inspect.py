@@ -15,9 +15,6 @@
 DRAC inspection interface
 """
 
-from datetime import datetime
-import json
-import re
 import xml.etree.ElementTree as et
 
 from ironic_lib import metrics_utils
