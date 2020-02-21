@@ -469,7 +469,6 @@ class DracRedfishInspectionTestCase(test_utils.BaseDracTest):
         system_mock.boot.mode = 'bios'
         export_configuration = {
             '_content': '<SystemConfiguration Model="PowerEdge R640" '
-                        'ServiceTag="DLMP4Z2" '
                         'TimeStamp="Thu Jan 23 09:27:07 2020">\n'
                         '<Component FQDD="NIC.Integrated.1-1-1">\n'
                         '<Attribute Name="LegacyBootProto">PXE</Attribute>\n'
