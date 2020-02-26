@@ -112,7 +112,7 @@ class DracRedfishInspect(redfish_inspect.RedfishInspect):
         pxe_nics = ["PxeDev1Interface", "PxeDev2Interface",
                     "PxeDev3Interface", "PxeDev4Interface"]
 
-        redfish_ip = task.node.driver_info.get('redfish_address')
+        redfish_address = task.node.driver_info.get('redfish_address')
         redfish_username = task.node.driver_info.get('redfish_username')
         redfish_password = task.node.driver_info.get('redfish_password')
 
@@ -130,10 +130,11 @@ class DracRedfishInspect(redfish_inspect.RedfishInspect):
         elif system.boot.mode == 'bios':
             # Get instance of OEM extension
             authenticator = sushy.auth.BasicAuth(redfish_username, redfish_password)
-            url = '%s%s' % (redfish_ip, _SERVICE_ROOT)
+            url = '%s%s' % (redfish_address, _SERVICE_ROOT)
             conn = sushy.Sushy(url, verify=False, auth=authenticator)
             manager = conn.get_manager('iDRAC.Embedded.1')
             oem_manager = manager.get_oem_extension('Dell')
+            # Get NIC configuration
             job_response = oem_manager.export_system_configuration(target="NIC")
 
             if job_response.status_code != _JOB_RESPONSE_CODE:
@@ -149,12 +150,12 @@ class DracRedfishInspect(redfish_inspect.RedfishInspect):
                 xml_string = job_response.__dict__.get('_content')
                 root = et.fromstring(xml_string)
                 for child in root:
-                    nic_id = [child.attrib.get('FQDD') for ch in child if
-                              ch.text == 'PXE']
-                    if nic_id:
-                        # Get MAC address of the given nic_id
-                        mac_address = ethernet_interfaces_mac_dict[nic_id[0]]
-                        pxe_port_macs.append(mac_address)
+                    for ch in child:
+                        if ch.attrib.get("Name") == "LegacyBootProto":
+                            nic_id = child.attrib.get('FQDD') if ch.text == "PXE" else None
+                            if nic_id:
+                                mac_address = ethernet_interfaces_mac_dict[nic_id]
+                                pxe_port_macs.append(mac_address)
                 return pxe_port_macs
             else:
                 error = (_('Failed to get system configuration from response'))
